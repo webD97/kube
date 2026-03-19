@@ -66,6 +66,8 @@ pub mod schema;
 
 pub mod subresource;
 
+pub mod table;
+
 pub mod util;
 
 pub mod watch;

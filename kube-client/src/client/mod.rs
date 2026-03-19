@@ -15,7 +15,11 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1 as k8s_meta_v1;
-use kube_core::{discovery::v2::ACCEPT_AGGREGATED_DISCOVERY_V2, response::Status};
+use kube_core::{
+    discovery::v2::ACCEPT_AGGREGATED_DISCOVERY_V2,
+    response::Status,
+    table::{Table, TableWatchEvent},
+};
 use serde::de::DeserializeOwned;
 use serde_json::{self, Value};
 #[cfg(feature = "ws")]
@@ -336,19 +340,16 @@ impl Client {
         }
     }
 
-    /// Perform a raw request and get back a stream of [`WatchEvent`] objects
-    pub async fn request_events<T>(
+    /// Send `request` and frame the streaming response body into newline-delimited lines.
+    async fn watch_frames(
         &self,
         request: Request<Vec<u8>>,
-    ) -> Result<impl TryStream<Item = Result<WatchEvent<T>>> + use<T>>
-    where
-        T: Clone + DeserializeOwned,
-    {
+    ) -> Result<impl TryStream<Item = std::result::Result<String, LinesCodecError>> + use<>> {
         let res = self.send(request.map(Body::from)).await?;
         // trace!("Streaming from {} -> {}", res.url(), res.status().as_str());
         tracing::trace!("headers: {:?}", res.headers());
 
-        let frames = FramedRead::new(
+        Ok(FramedRead::new(
             StreamReader::new(res.into_body().into_data_stream().map_err(|e| {
                 // Unexpected EOF from chunked decoder.
                 // Tends to happen when watching for 300+s. This will be ignored.
@@ -358,49 +359,88 @@ impl Client {
                 std::io::Error::other(e)
             })),
             LinesCodec::new(),
-        );
+        ))
+    }
 
-        Ok(frames.filter_map(|res| async {
-            match res {
-                Ok(line) => match serde_json::from_str::<WatchEvent<T>>(&line) {
-                    Ok(event) => Some(Ok(event)),
-                    Err(e) => {
-                        // Ignore EOF error that can happen for incomplete line from `decode_eof`.
-                        if e.is_eof() {
-                            return None;
-                        }
+    /// Perform a raw request and get back a stream of [`WatchEvent`] objects
+    pub async fn request_events<T>(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> Result<impl TryStream<Item = Result<WatchEvent<T>>> + use<T>>
+    where
+        T: Clone + DeserializeOwned,
+    {
+        let frames = self.watch_frames(request).await?;
+        Ok(frames.filter_map(|res| async move { decode_watch_line::<WatchEvent<T>>(res) }))
+    }
 
-                        // Got general error response
-                        if let Ok(status) = serde_json::from_str::<Status>(&line) {
-                            return Some(Err(Error::Api(status.boxed())));
-                        }
-                        // Parsing error
-                        Some(Err(Error::SerdeError(e)))
-                    }
-                },
-
-                Err(LinesCodecError::Io(e)) => match e.kind() {
-                    // Client timeout
-                    std::io::ErrorKind::TimedOut => {
-                        tracing::warn!("timeout in poll: {}", e); // our client timeout
-                        None
-                    }
-                    // Unexpected EOF from chunked decoder.
-                    // Tends to happen after 300+s of watching.
-                    std::io::ErrorKind::UnexpectedEof => {
-                        tracing::warn!("eof in poll: {}", e);
-                        None
-                    }
-                    _ => Some(Err(Error::ReadEvents(e))),
-                },
-
-                // Reached the maximum line length without finding a newline.
-                // This should never happen because we're using the default `usize::MAX`.
-                Err(LinesCodecError::MaxLineLengthExceeded) => {
-                    Some(Err(Error::LinesCodecMaxLineLengthExceeded))
-                }
-            }
+    /// Perform a raw request and get back a stream of [`WatchEvent`] objects in
+    /// the server-rendered [`Table`] presentation used by `kubectl get`.
+    ///
+    /// Unlike [`request_events`](Self::request_events), bookmark events are
+    /// decoded from the full table so the `k8s.io/initial-events-end` marker —
+    /// which the apiserver records on the bookmark's embedded row object for
+    /// `as=Table` watches — survives, making streaming lists
+    /// (`sendInitialEvents=true`) work for table watches.
+    pub async fn request_table_events<T>(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> Result<impl TryStream<Item = Result<WatchEvent<Table<T>>>> + use<T>>
+    where
+        T: Clone + DeserializeOwned,
+    {
+        let frames = self.watch_frames(request).await?;
+        Ok(frames.filter_map(|res| async move {
+            decode_watch_line::<TableWatchEvent<T>>(res).map(|result| result.map(WatchEvent::from))
         }))
+    }
+}
+
+/// Decode a single newline-delimited watch frame into an event of type `E`.
+///
+/// Returns `None` for frames that should be silently skipped (client timeouts,
+/// expected EOFs from the chunked decoder). On a deserialization failure the
+/// line is retried as a [`Status`] so apiserver error responses surface as
+/// [`Error::Api`] rather than an opaque parse error.
+fn decode_watch_line<E: DeserializeOwned>(
+    res: std::result::Result<String, LinesCodecError>,
+) -> Option<Result<E>> {
+    match res {
+        Ok(line) => match serde_json::from_str::<E>(&line) {
+            Ok(event) => Some(Ok(event)),
+            Err(e) => {
+                // Ignore EOF error that can happen for incomplete line from `decode_eof`.
+                if e.is_eof() {
+                    return None;
+                }
+
+                // Got general error response
+                if let Ok(status) = serde_json::from_str::<Status>(&line) {
+                    return Some(Err(Error::Api(status.boxed())));
+                }
+                // Parsing error
+                Some(Err(Error::SerdeError(e)))
+            }
+        },
+
+        Err(LinesCodecError::Io(e)) => match e.kind() {
+            // Client timeout
+            std::io::ErrorKind::TimedOut => {
+                tracing::warn!("timeout in poll: {}", e); // our client timeout
+                None
+            }
+            // Unexpected EOF from chunked decoder.
+            // Tends to happen after 300+s of watching.
+            std::io::ErrorKind::UnexpectedEof => {
+                tracing::warn!("eof in poll: {}", e);
+                None
+            }
+            _ => Some(Err(Error::ReadEvents(e))),
+        },
+
+        // Reached the maximum line length without finding a newline.
+        // This should never happen because we're using the default `usize::MAX`.
+        Err(LinesCodecError::MaxLineLengthExceeded) => Some(Err(Error::LinesCodecMaxLineLengthExceeded)),
     }
 }
 

@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt, stream::BoxStream};
 use kube_client::{
     Api, Error as ClientErr,
     api::{ListParams, Resource, ResourceExt, VersionMatch, WatchEvent, WatchParams},
-    core::{ObjectList, Selector, metadata::PartialObjectMeta},
+    core::{ObjectList, Selector, metadata::PartialObjectMeta, table::Table},
     error::Status,
 };
 use serde::de::DeserializeOwned;
@@ -145,12 +145,29 @@ enum State<K> {
     },
 }
 
+/// Abstraction over the result of a list call, used by the watcher state machine.
+struct ListResult<V> {
+    resource_version: Option<String>,
+    continue_token: Option<String>,
+    items: VecDeque<V>,
+}
+
+impl<V: Clone> From<ObjectList<V>> for ListResult<V> {
+    fn from(list: ObjectList<V>) -> Self {
+        Self {
+            resource_version: list.metadata.resource_version,
+            continue_token: list.metadata.continue_,
+            items: list.items.into_iter().collect(),
+        }
+    }
+}
+
 /// Used to control whether the watcher receives the full object, or only the
 /// metadata
 trait ApiMode {
     type Value: Clone;
 
-    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>>;
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ListResult<Self::Value>>;
     async fn watch(
         &self,
         wp: &WatchParams,
@@ -437,8 +454,8 @@ where
 {
     type Value = K;
 
-    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
-        self.api.list(lp).await
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ListResult<Self::Value>> {
+        self.api.list(lp).await.map(Into::into)
     }
 
     async fn watch(
@@ -462,8 +479,8 @@ where
 {
     type Value = PartialObjectMeta<K>;
 
-    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
-        self.api.list_metadata(lp).await
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ListResult<Self::Value>> {
+        self.api.list_metadata(lp).await.map(Into::into)
     }
 
     async fn watch(
@@ -501,6 +518,36 @@ where
             );
             None
         }
+    }
+}
+
+/// A wrapper around the `Api` of a `Resource` type that when used by the
+/// watcher will return the server-generated table presentation of the resource
+struct TableOnly<'a, K> {
+    api: &'a Api<K>,
+}
+
+impl<K> ApiMode for TableOnly<'_, K>
+where
+    K: Clone + Debug + DeserializeOwned + Send + 'static,
+{
+    type Value = Table<K>;
+
+    async fn list(&self, lp: &ListParams) -> kube_client::Result<ListResult<Table<K>>> {
+        let table = self.api.list_table(lp).await?;
+        Ok(ListResult {
+            resource_version: table.metadata.object_meta.resource_version.clone(),
+            continue_token: table.metadata.continue_.clone(),
+            items: VecDeque::from([table]),
+        })
+    }
+
+    async fn watch(
+        &self,
+        wp: &WatchParams,
+        version: &str,
+    ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>> {
+        self.api.watch_table(wp, version).await.map(StreamExt::boxed)
     }
 }
 
@@ -562,8 +609,8 @@ where
             lp.continue_token = continue_token;
             match api.list(&lp).await {
                 Ok(list) => {
-                    let last_bookmark = list.metadata.resource_version.filter(|s| !s.is_empty());
-                    let continue_token = list.metadata.continue_.filter(|s| !s.is_empty());
+                    let last_bookmark = list.resource_version.filter(|s| !s.is_empty());
+                    let continue_token = list.continue_token.filter(|s| !s.is_empty());
                     if last_bookmark.is_none() && continue_token.is_none() {
                         return (Some(Err(Error::NoResourceVersion)), State::Empty);
                     }
@@ -571,7 +618,7 @@ where
                     // until the objects buffer has drained
                     (None, State::InitPage {
                         continue_token,
-                        objects: list.items.into_iter().collect(),
+                        objects: list.items,
                         last_bookmark,
                     })
                 }
@@ -865,6 +912,30 @@ pub fn metadata_watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 
     )
 }
 
+/// Watch a resource in the server-rendered [`Table`] presentation used by `kubectl get`.
+///
+/// Emits [`Event`]s whose payload is a [`Table`]. With the default
+/// [`InitialListStrategy::ListWatch`] the initial list arrives as a single
+/// [`Event::InitApply`] holding every row; with [`InitialListStrategy::StreamingList`]
+/// each initial object arrives as its own single-row [`Event::InitApply`].
+/// Subsequent watch events carry single-row tables in both modes.
+///
+/// Streaming lists ([`InitialListStrategy::StreamingList`]) are supported via
+/// [`Api::watch_table`], which recovers the `k8s.io/initial-events-end` marker
+/// from the bookmark's embedded row object.
+pub fn table_watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
+    api: Api<K>,
+    watcher_config: Config,
+) -> impl Stream<Item = Result<Event<Table<K>>>> + Send {
+    futures::stream::unfold(
+        (api, watcher_config, State::default()),
+        |(api, watcher_config, state)| async {
+            let (event, state) = step(&TableOnly { api: &api }, &watcher_config, state).await;
+            Some((event, (api, watcher_config, state)))
+        },
+    )
+}
+
 /// Watch a single named object for updates
 ///
 /// Emits `None` if the object is deleted (or not found), and `Some` if an object is updated (or created/found).
@@ -1094,5 +1165,80 @@ mod tests {
         let mut stream = futures::stream::empty::<i32>();
         let result = next_with_idle_timeout(&mut stream, Some(290)).await;
         assert_eq!(result, None);
+    }
+
+    type MockTableEvent = kube_client::Result<WatchEvent<Table<kube_client::core::DynamicObject>>>;
+
+    /// An [`ApiMode`] that replays a fixed set of watch events from a single
+    /// `watch()` call, used to drive the state machine in tests.
+    struct MockTableWatch {
+        events: std::sync::Mutex<Option<Vec<MockTableEvent>>>,
+    }
+
+    impl ApiMode for MockTableWatch {
+        type Value = Table<kube_client::core::DynamicObject>;
+
+        async fn list(&self, _lp: &ListParams) -> kube_client::Result<ListResult<Self::Value>> {
+            unreachable!("streaming list mode never calls list()")
+        }
+
+        async fn watch(
+            &self,
+            _wp: &WatchParams,
+            _version: &str,
+        ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>> {
+            let events = self.events.lock().unwrap().take().unwrap_or_default();
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    // End-to-end regression test for the table streaming-list path. The
+    // `initial-events-end` marker lives on the bookmark's embedded row object;
+    // once `TableWatchEvent` conversion recovers it, the watcher must transition
+    // out of the initial phase so a subsequent delete is a normal `Event::Delete`
+    // and never trips the "deleted event during initial watch" error.
+    #[tokio::test]
+    async fn streaming_list_table_watch_transitions_then_handles_delete() {
+        use kube_client::core::{DynamicObject, table::TableWatchEvent};
+
+        let parse = |line: &str| -> WatchEvent<Table<DynamicObject>> {
+            serde_json::from_str::<TableWatchEvent>(line).unwrap().into()
+        };
+
+        let added = parse(
+            r#"{"type":"ADDED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"10"},"columnDefinitions":[{"name":"Name","type":"string","format":"name","description":"","priority":0}],"rows":[{"cells":["nginx"],"object":{"kind":"PartialObjectMetadata","metadata":{"name":"nginx","resourceVersion":"10"}}}]}}"#,
+        );
+        let bookmark = parse(
+            r#"{"type":"BOOKMARK","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"11"},"columnDefinitions":null,"rows":[{"cells":[],"object":{"kind":"PartialObjectMetadata","metadata":{"resourceVersion":"11","annotations":{"k8s.io/initial-events-end":"true"}}}}]}}"#,
+        );
+        let deleted = parse(
+            r#"{"type":"DELETED","object":{"kind":"Table","apiVersion":"meta.k8s.io/v1","metadata":{"resourceVersion":"12"},"columnDefinitions":null,"rows":[{"cells":["nginx"],"object":{"kind":"PartialObjectMetadata","metadata":{"name":"nginx","resourceVersion":"12"}}}]}}"#,
+        );
+
+        let api = MockTableWatch {
+            events: std::sync::Mutex::new(Some(vec![Ok(added), Ok(bookmark), Ok(deleted)])),
+        };
+        let config = Config::default().streaming_lists();
+
+        let mut state = State::default();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let (event, next) = step(&api, &config, state).await;
+            events.push(event.expect("table streaming list should not produce an error"));
+            state = next;
+        }
+
+        assert!(
+            matches!(events[0], Event::InitApply(_)),
+            "first streamed object should be an InitApply"
+        );
+        assert!(
+            matches!(events[1], Event::InitDone),
+            "initial-events-end bookmark must yield InitDone (annotation recovered from the row object)"
+        );
+        assert!(
+            matches!(events[2], Event::Delete(_)),
+            "a delete after the initial list must be a normal Delete, not the initial-watch bug"
+        );
     }
 }

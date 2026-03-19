@@ -18,6 +18,8 @@ pub(crate) const JSON_METADATA_MIME: &str = "application/json;as=PartialObjectMe
 pub(crate) const JSON_METADATA_LIST_MIME: &str =
     "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
 
+pub(crate) const JSON_TABLE_MIME: &str = "application/json;as=Table;v=v1;g=meta.k8s.io";
+
 /// Possible errors when building a request.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -294,6 +296,20 @@ impl Request {
         req.body(vec![]).map_err(Error::BuildRequest)
     }
 
+    /// List a table of resources
+    pub fn list_table(&self, lp: &ListParams) -> Result<http::Request<Vec<u8>>, Error> {
+        let target = format!("{}?", self.url_path);
+        let mut qp = form_urlencoded::Serializer::new(target);
+        lp.validate()?;
+        lp.populate_qp(&mut qp);
+        let urlstr = qp.finish();
+        let req = http::Request::get(urlstr)
+            .header(http::header::ACCEPT, JSON_TABLE_MIME)
+            .header(http::header::CONTENT_TYPE, JSON_MIME);
+
+        req.body(vec![]).map_err(Error::BuildRequest)
+    }
+
     /// Watch metadata of a resource at a given version
     pub fn watch_metadata(&self, wp: &WatchParams, ver: &str) -> Result<http::Request<Vec<u8>>, Error> {
         let target = format!("{}?", self.url_path);
@@ -305,6 +321,22 @@ impl Request {
         let urlstr = qp.finish();
         http::Request::get(urlstr)
             .header(http::header::ACCEPT, JSON_METADATA_MIME)
+            .header(http::header::CONTENT_TYPE, JSON_MIME)
+            .body(vec![])
+            .map_err(Error::BuildRequest)
+    }
+
+    /// Watch a table of resources
+    pub fn watch_table(&self, wp: &WatchParams, ver: &str) -> Result<http::Request<Vec<u8>>, Error> {
+        let target = format!("{}?", self.url_path);
+        let mut qp = form_urlencoded::Serializer::new(target);
+        wp.validate()?;
+        wp.populate_qp(&mut qp);
+        qp.append_pair("resourceVersion", ver);
+
+        let urlstr = qp.finish();
+        http::Request::get(urlstr)
+            .header(http::header::ACCEPT, JSON_TABLE_MIME)
             .header(http::header::CONTENT_TYPE, JSON_MIME)
             .body(vec![])
             .map_err(Error::BuildRequest)

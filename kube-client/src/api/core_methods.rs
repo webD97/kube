@@ -4,7 +4,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
 use crate::{Error, Result, api::Api};
-use kube_core::{WatchEvent, metadata::PartialObjectMeta, object::ObjectList, params::*, response::Status};
+use kube_core::{
+    WatchEvent, metadata::PartialObjectMeta, object::ObjectList, params::*, response::Status, table::Table,
+};
 
 /// PUSH/PUT/POST/GET abstractions
 impl<K> Api<K>
@@ -255,6 +257,16 @@ where
         let mut req = self.request.list_metadata(lp).map_err(Error::BuildRequest)?;
         req.extensions_mut().insert("list_metadata");
         self.client.request::<ObjectList<PartialObjectMeta<K>>>(req).await
+    }
+
+    /// List resources in the server-rendered [`Table`] presentation used by `kubectl get`.
+    ///
+    /// The apiserver returns the columnar view (column definitions plus one row
+    /// per resource) rather than the full objects.
+    pub async fn list_table(&self, lp: &ListParams) -> Result<Table<K>> {
+        let mut req = self.request.list_table(lp).map_err(Error::BuildRequest)?;
+        req.extensions_mut().insert("list_table");
+        self.client.request::<Table<K>>(req).await
     }
 
     /// Create a resource
@@ -613,5 +625,23 @@ where
             .map_err(Error::BuildRequest)?;
         req.extensions_mut().insert("watch_metadata");
         self.client.request_events::<PartialObjectMeta<K>>(req).await
+    }
+
+    /// Watch a resource in the server-rendered [`Table`] presentation used by `kubectl get`.
+    ///
+    /// Bookmark events are decoded from the full table so the
+    /// `k8s.io/initial-events-end` marker survives, which lets streaming lists
+    /// (`sendInitialEvents=true`) work for table watches.
+    pub async fn watch_table(
+        &self,
+        wp: &WatchParams,
+        version: &str,
+    ) -> Result<impl Stream<Item = Result<WatchEvent<Table<K>>>> + use<K>> {
+        let mut req = self
+            .request
+            .watch_table(wp, version)
+            .map_err(Error::BuildRequest)?;
+        req.extensions_mut().insert("watch_table");
+        self.client.request_table_events::<K>(req).await
     }
 }
