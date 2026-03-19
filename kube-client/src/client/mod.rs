@@ -15,7 +15,11 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use jiff::Timestamp;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1 as k8s_meta_v1;
-use kube_core::{discovery::v2::ACCEPT_AGGREGATED_DISCOVERY_V2, response::Status};
+use kube_core::{
+    discovery::v2::ACCEPT_AGGREGATED_DISCOVERY_V2,
+    response::Status,
+    table::{Table, TableWatchEvent},
+};
 use serde::de::DeserializeOwned;
 use serde_json::{self, Value};
 #[cfg(feature = "ws")]
@@ -344,6 +348,36 @@ impl Client {
     where
         T: Clone + DeserializeOwned,
     {
+        self.request_watch_lines::<WatchEvent<T>>(request).await
+    }
+
+    /// Perform a raw request and get back a stream of [`WatchEvent`] objects in
+    /// the server-rendered [`Table`] presentation used by `kubectl get`.
+    ///
+    /// Unlike [`request_events`](Self::request_events), bookmark events are
+    /// decoded from the full table so the `k8s.io/initial-events-end` marker —
+    /// which the apiserver records on the bookmark's embedded row object for
+    /// `as=Table` watches — survives, making streaming lists
+    /// (`sendInitialEvents=true`) work for table watches.
+    pub async fn request_table_events<T>(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> Result<impl TryStream<Item = Result<WatchEvent<Table<T>>>> + use<T>>
+    where
+        T: Clone + DeserializeOwned,
+    {
+        let events = self.request_watch_lines::<TableWatchEvent<T>>(request).await?;
+        Ok(events.map(|res| res.map(WatchEvent::from)))
+    }
+
+    /// Perform a raw request and decode each newline-delimited line of the response as an `E`
+    async fn request_watch_lines<E>(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> Result<impl futures::Stream<Item = Result<E>> + use<E>>
+    where
+        E: DeserializeOwned,
+    {
         let res = self.send(request.map(Body::from)).await?;
         // trace!("Streaming from {} -> {}", res.url(), res.status().as_str());
         tracing::trace!("headers: {:?}", res.headers());
@@ -362,7 +396,7 @@ impl Client {
 
         Ok(frames.filter_map(|res| async {
             match res {
-                Ok(line) => match serde_json::from_str::<WatchEvent<T>>(&line) {
+                Ok(line) => match serde_json::from_str::<E>(&line) {
                     Ok(event) => Some(Ok(event)),
                     Err(e) => {
                         // Ignore EOF error that can happen for incomplete line from `decode_eof`.
